@@ -3,18 +3,24 @@ package com.yalantis.ucrop.util;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Matrix;
+import android.graphics.Point;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
-import android.os.ParcelFileDescriptor;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.util.Log;
+import android.view.Display;
+import android.view.WindowManager;
+
+import com.yalantis.ucrop.callback.BitmapLoadCallback;
+import com.yalantis.ucrop.task.BitmapLoadTask;
 
 import java.io.Closeable;
-import java.io.FileDescriptor;
 import java.io.IOException;
+import java.io.InputStream;
 
 /**
  * Created by Oleksii Shliama (https://github.com/shliama).
@@ -23,54 +29,22 @@ public class BitmapLoadUtils {
 
     private static final String TAG = "BitmapLoadUtils";
 
-    @Nullable
-    public static Bitmap decode(@NonNull Context context, @Nullable Uri uri,
-                                int requiredWidth, int requiredHeight) throws Exception {
-        if (uri == null) {
-            return null;
-        }
+    public static void decodeBitmapInBackground(@NonNull Context context,
+                                                @NonNull Uri uri, @Nullable Uri outputUri,
+                                                int requiredWidth, int requiredHeight,
+                                                BitmapLoadCallback loadCallback) {
 
-        final ParcelFileDescriptor parcelFileDescriptor = context.getContentResolver().openFileDescriptor(uri, "r");
-        FileDescriptor fileDescriptor;
-        if (parcelFileDescriptor != null) {
-            fileDescriptor = parcelFileDescriptor.getFileDescriptor();
-        } else {
-            return null;
-        }
-
-        final BitmapFactory.Options options = new BitmapFactory.Options();
-
-        options.inJustDecodeBounds = true;
-        BitmapFactory.decodeFileDescriptor(fileDescriptor, null, options);
-        options.inSampleSize = calculateInSampleSize(options, requiredWidth, requiredHeight);
-        options.inJustDecodeBounds = false;
-
-        Bitmap decodeSampledBitmap = BitmapFactory.decodeFileDescriptor(fileDescriptor, null, options);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-            close(parcelFileDescriptor);
-        }
-
-        ExifInterface exif = getExif(uri);
-        if (exif != null) {
-            int exifOrientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
-            // TODO Should not rotate bitmap but initially apply needed angle to the matrix
-            return rotateBitmap(decodeSampledBitmap, exifToDegrees(exifOrientation));
-        } else {
-            return decodeSampledBitmap;
-        }
+        new BitmapLoadTask(context, uri, outputUri, requiredWidth, requiredHeight, loadCallback).execute();
     }
 
-    public static Bitmap rotateBitmap(@Nullable Bitmap bitmap, int degrees) {
-        if (bitmap != null && degrees != 0) {
-            Matrix rotateMatrix = new Matrix();
-            rotateMatrix.setRotate(degrees, bitmap.getWidth() / (float) 2, bitmap.getHeight() / (float) 2);
-
-            Bitmap converted = Bitmap.createBitmap(bitmap, 0, 0,
-                    bitmap.getWidth(), bitmap.getHeight(), rotateMatrix, true);
-            if (bitmap != converted) {
-                bitmap.recycle();
+    public static Bitmap transformBitmap(@NonNull Bitmap bitmap, @NonNull Matrix transformMatrix) {
+        try {
+            Bitmap converted = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), transformMatrix, true);
+            if (!bitmap.sameAs(converted)) {
                 bitmap = converted;
             }
+        } catch (OutOfMemoryError error) {
+            Log.e(TAG, "transformBitmap: ", error);
         }
         return bitmap;
     }
@@ -91,25 +65,97 @@ public class BitmapLoadUtils {
         return inSampleSize;
     }
 
-    @Nullable
-    private static ExifInterface getExif(@NonNull Uri imageUri) {
+    public static int getExifOrientation(@NonNull Context context, @NonNull Uri imageUri) {
+        int orientation = ExifInterface.ORIENTATION_UNDEFINED;
         try {
-            return new ExifInterface(imageUri.getPath());
+            InputStream stream = context.getContentResolver().openInputStream(imageUri);
+            if (stream == null) {
+                return orientation;
+            }
+            orientation = new ImageHeaderParser(stream).getOrientation();
+            close(stream);
         } catch (IOException e) {
-            Log.w(TAG, "getExif: ", e);
+            Log.e(TAG, "getExifOrientation: " + imageUri.toString(), e);
         }
-        return null;
+        return orientation;
     }
 
-    private static int exifToDegrees(int exifOrientation) {
-        if (exifOrientation == ExifInterface.ORIENTATION_ROTATE_90) {
-            return 90;
-        } else if (exifOrientation == ExifInterface.ORIENTATION_ROTATE_180) {
-            return 180;
-        } else if (exifOrientation == ExifInterface.ORIENTATION_ROTATE_270) {
-            return 270;
+    public static int exifToDegrees(int exifOrientation) {
+        int rotation;
+        switch (exifOrientation) {
+            case ExifInterface.ORIENTATION_ROTATE_90:
+            case ExifInterface.ORIENTATION_TRANSPOSE:
+                rotation = 90;
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_180:
+            case ExifInterface.ORIENTATION_FLIP_VERTICAL:
+                rotation = 180;
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_270:
+            case ExifInterface.ORIENTATION_TRANSVERSE:
+                rotation = 270;
+                break;
+            default:
+                rotation = 0;
         }
-        return 0;
+        return rotation;
+    }
+
+    public static int exifToTranslation(int exifOrientation) {
+        int translation;
+        switch (exifOrientation) {
+            case ExifInterface.ORIENTATION_FLIP_HORIZONTAL:
+            case ExifInterface.ORIENTATION_FLIP_VERTICAL:
+            case ExifInterface.ORIENTATION_TRANSPOSE:
+            case ExifInterface.ORIENTATION_TRANSVERSE:
+                translation = -1;
+                break;
+            default:
+                translation = 1;
+        }
+        return translation;
+    }
+
+    /**
+     * This method calculates maximum size of both width and height of bitmap.
+     * It is twice the device screen diagonal for default implementation (extra quality to zoom image).
+     * Size cannot exceed max texture size.
+     *
+     * @return - max bitmap size in pixels.
+     */
+    @SuppressWarnings({"SuspiciousNameCombination", "deprecation"})
+    public static int calculateMaxBitmapSize(@NonNull Context context) {
+        WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+        Display display;
+        int width, height;
+        Point size = new Point();
+
+        if (wm != null) {
+            display = wm.getDefaultDisplay();
+            display.getSize(size);
+        }
+
+        width = size.x;
+        height = size.y;
+
+        // Twice the device screen diagonal as default
+        int maxBitmapSize = (int) Math.sqrt(Math.pow(width, 2) + Math.pow(height, 2));
+
+        // Check for max texture size via Canvas
+        Canvas canvas = new Canvas();
+        final int maxCanvasSize = Math.min(canvas.getMaximumBitmapWidth(), canvas.getMaximumBitmapHeight());
+        if (maxCanvasSize > 0) {
+            maxBitmapSize = Math.min(maxBitmapSize, maxCanvasSize);
+        }
+
+        // Check for max texture size via GL
+        final int maxTextureSize = EglUtils.getMaxTextureSize();
+        if (maxTextureSize > 0) {
+            maxBitmapSize = Math.min(maxBitmapSize, maxTextureSize);
+        }
+
+        Log.d(TAG, "maxBitmapSize: " + maxBitmapSize);
+        return maxBitmapSize;
     }
 
     @SuppressWarnings("ConstantConditions")
